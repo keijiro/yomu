@@ -1,0 +1,14 @@
+# Virtualenv
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Working data: reference audio, the script being read, and generated wavs
+refs/
+script.txt
+output/
+
+# macOS
+.DS_Store

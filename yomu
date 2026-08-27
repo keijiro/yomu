@@ -1,0 +1,25 @@
+#!/bin/sh
+# Launcher for yomu. Runs the TUI with the project's virtualenv, from any cwd.
+set -e
+
+root=$(cd "$(dirname "$0")" && pwd)
+python="$root/.venv/bin/python"
+
+if [ ! -x "$python" ]; then
+    echo "yomu: virtualenv not found at $root/.venv" >&2
+    echo "Create it first:" >&2
+    echo "    uv venv --python 3.12 .venv" >&2
+    echo "    uv pip install -p .venv/bin/python -r requirements.txt" >&2
+    exit 1
+fi
+
+# Opt out of the Kitty keyboard protocol. Terminals that support it deliver
+# IME-committed text inside the key event ("report associated text"), and
+# Textual abandons any escape sequence longer than 32 characters -- which a
+# commit of 5 or more Japanese characters exceeds, leaking the raw sequence
+# into the input field. The legacy encoding has no such limit, and none of
+# our key bindings need the protocol's disambiguation.
+TEXTUAL_DISABLE_KITTY_KEY=1
+export TEXTUAL_DISABLE_KITTY_KEY
+
+exec "$python" "$root/tui.py" "$@"
