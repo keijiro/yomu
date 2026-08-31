@@ -33,6 +33,8 @@ from tts_core import (
     DEFAULT_MODEL,
     DEFAULT_SEED,
     Line,
+    SCALE_MAX,
+    SCALE_MIN,
     Script,
     Synth,
     Take,
@@ -70,6 +72,7 @@ class Job:
     seed: int
     text: str
     path: Path
+    scale: float  # Resolved duration scale; never None, mlx casts it with float()
     kind: str  # "final" (committed to output/) | "take" (candidate in takes/)
     generation: int  # Script revision; results from before a reload are dropped
     autoplay: bool = False
@@ -159,6 +162,7 @@ class TtsApp(App):
         Binding("a", "generate_all", "Generate all"),
         Binding("e", "edit_text", "Edit text"),
         Binding("i", "edit_instruct", "Instruct", show=False),
+        Binding("s", "edit_scale", "Scale", show=False),
         Binding("x", "drop_takes", "Drop takes", show=False),
         Binding("c", "cancel_queue", "Cancel queue", show=False),
         Binding("u", "reload", "Reload", show=False),
@@ -171,13 +175,14 @@ class TtsApp(App):
         ("status", "status", 12),
         ("seed", "seed", 6),
         ("sec", "sec", 6),
+        ("dur", "dur", 5),
         ("text", "text", 48),
     ]
 
     def __init__(self, args: argparse.Namespace, refs: list[str]) -> None:
         super().__init__()
         self.args = args
-        self.script = Script(args.script, args.seed)
+        self.script = Script(args.script, args.seed, args.duration_scale)
         self.out_dir = Path(args.out)
         self.takes_dir = self.out_dir / TAKES_DIR
         self.rows: list[Row] = []
@@ -187,7 +192,9 @@ class TtsApp(App):
         gen_kwargs = {
             "sequence_length": args.seq_len,
             "cfg_guidance_mode": args.cfg_mode,
-            "duration_scale": args.duration_scale,
+            # Every job passes its own resolved scale, which wins. This is only
+            # the fallback that keeps Synth safe for a caller that does not.
+            "duration_scale": self.script.default_scale,
         }
         if args.num_steps:
             gen_kwargs["num_steps"] = args.num_steps
@@ -241,6 +248,9 @@ class TtsApp(App):
             self.log_line(f"[dim]renamed {entry}")
         for name in removed:
             self.log_line(f"[dim]removed {name}")
+        for warning in self.script.warnings:
+            self.log_line(f"[yellow]{warning}")
+        self.script.warnings.clear()
 
         self.rows = [Row(line=line) for line in self.script.lines]
         for row in self.rows:
@@ -262,13 +272,16 @@ class TtsApp(App):
 
     def cells(self, row: Row) -> list:
         # Seed and duration show whatever is currently being auditioned, which
-        # is the candidate's values while cycling through takes.
+        # is the candidate's values while cycling through takes. The scale
+        # belongs to the line, so takes inherit it and it never varies here.
+        # ASCII "x", not the multiplication sign, whose width is ambiguous.
         take = row.viewing
         return [
             str(row.line.index),
             self.status_cell(row),
             str(take.seed if take else row.line.seed),
             f"{take.seconds:.2f}" if take else "-",
+            f"x{row.line.scale:g}" if row.line.scale is not None else "-",
             _fit(row.line.text, self._text_width),
         ]
 
@@ -287,7 +300,7 @@ class TtsApp(App):
     def refresh_row(self, row: Row) -> None:
         table = self.query_one(LineTable)
         key = f"L{row.line.index}"
-        for (column, _, _), value in zip(self.COLUMNS, self.cells(row)):
+        for (column, _, _), value in zip(self.COLUMNS, self.cells(row), strict=True):
             table.update_cell(key, column, value)
 
     @property
@@ -303,7 +316,7 @@ class TtsApp(App):
             f"model {model}",
             f"refs {len(self.synth.refs)}",
             f"instruct {self.synth.instruct or '-'}",
-            f"dur×{self.args.duration_scale}",
+            f"dur×{self.script.default_scale:g}",
             f"queue {self._jobs.qsize()}",
         ]
         if self.dirty_on_disk:
@@ -337,7 +350,13 @@ class TtsApp(App):
                 continue
             try:
                 self.call_from_thread(self._on_job_start, job)
-                take = self.synth.generate(job.text, job.seed, job.path, self._log_from_thread)
+                take = self.synth.generate(
+                    job.text,
+                    job.seed,
+                    job.path,
+                    self._log_from_thread,
+                    duration_scale=job.scale,
+                )
             except Exception as exc:
                 self.call_from_thread(self._on_job_fail, job, str(exc))
             else:
@@ -353,7 +372,11 @@ class TtsApp(App):
         if job.generation != self.generation or job.index > len(self.rows):
             return None
         row = self.rows[job.index - 1]
-        return row if row.line.text == job.text else None
+        if row.line.text != job.text:
+            return None
+        # A scale change moves the digest, so the wav no longer belongs to this
+        # row -- committing it would leave a filename that lies about its rate.
+        return row if self.script.effective_scale(row.line) == job.scale else None
 
     def _on_job_start(self, job: Job) -> None:
         row = self._row_for(job)
@@ -442,7 +465,15 @@ class TtsApp(App):
             self.notify("already up to date (f to force)")
             return
         self.enqueue(
-            Job(row.line.index, row.line.seed, row.line.text, path, "final", self.generation)
+            Job(
+                index=row.line.index,
+                seed=row.line.seed,
+                text=row.line.text,
+                path=path,
+                scale=self.script.effective_scale(row.line),
+                kind="final",
+                generation=self.generation,
+            )
         )
 
     def action_generate_all(self) -> None:
@@ -455,12 +486,13 @@ class TtsApp(App):
         for row in pending:
             self.enqueue(
                 Job(
-                    row.line.index,
-                    row.line.seed,
-                    row.line.text,
-                    self.out_dir / row.line.filename,
-                    "final",
-                    self.generation,
+                    index=row.line.index,
+                    seed=row.line.seed,
+                    text=row.line.text,
+                    path=self.out_dir / row.line.filename,
+                    scale=self.script.effective_scale(row.line),
+                    kind="final",
+                    generation=self.generation,
                 )
             )
         self.notify(f"queued {len(pending)} lines")
@@ -476,15 +508,20 @@ class TtsApp(App):
             if seed not in tried:
                 break
             seed = random.randrange(1, SEED_MAX)
-        candidate = Line(index=row.line.index, text=row.line.text, seed=seed)
+        # The candidate carries the line's scale so the take is auditioned at
+        # the same rate it will be adopted at.
+        candidate = Line(
+            index=row.line.index, text=row.line.text, seed=seed, scale=row.line.scale
+        )
         self.enqueue(
             Job(
-                row.line.index,
-                seed,
-                row.line.text,
-                self.takes_dir / candidate.filename,
-                "take",
-                self.generation,
+                index=row.line.index,
+                seed=seed,
+                text=row.line.text,
+                path=self.takes_dir / candidate.filename,
+                scale=self.script.effective_scale(row.line),
+                kind="take",
+                generation=self.generation,
                 autoplay=True,
             )
         )
@@ -552,6 +589,48 @@ class TtsApp(App):
 
         self.push_screen(PromptScreen("instruct (empty to clear)", self.synth.instruct or ""), done)
 
+    def action_edit_scale(self) -> None:
+        row = self.current
+        if row is None:
+            return
+
+        def done(value: str | None) -> None:
+            if value is None:
+                return
+            body = value.strip().lstrip("x\u00d7").strip()
+            if not body:
+                scale = None  # Back to inheriting the script default
+            else:
+                try:
+                    scale = float(f"{float(body):g}")
+                except ValueError:
+                    self.notify(f"not a number: {value.strip()}", severity="warning")
+                    return
+                if not SCALE_MIN <= scale <= SCALE_MAX:
+                    self.notify(
+                        f"duration scale must be {SCALE_MIN}-{SCALE_MAX}",
+                        severity="warning",
+                    )
+                    return
+            if scale == row.line.scale:
+                return
+            self.script.set_scale(row.line.index, scale)
+            self.script.save()
+            self.drop_takes(row)
+            row.adopted = None  # The digest moved, so the old wav is stale
+            self.refresh_row(row)
+            shown = f"x{scale:g}" if scale is not None else "default"
+            self.log_line(f"[{row.line.index:2d}] duration scale {shown} (g to generate)")
+
+        self.push_screen(
+            PromptScreen(
+                f"[{row.line.index}] duration scale "
+                f"(empty for the default {self.script.default_scale:g})",
+                f"{row.line.scale:g}" if row.line.scale is not None else "",
+            ),
+            done,
+        )
+
     def action_drop_takes(self) -> None:
         row = self.current
         if row:
@@ -573,11 +652,21 @@ class TtsApp(App):
 
     def action_reload(self) -> None:
         self.action_cancel_queue()
+        before = self.script.default_scale
         self.script.reload()
         self.generation += 1
         shutil.rmtree(self.takes_dir, ignore_errors=True)
         self.build_rows()
         self.log_line("reloaded script.txt")
+        if self.script.default_scale != before:
+            # The default is outside the hash, so nothing above is marked stale
+            # by it -- every row still reads "ready" at the old rate. Say so.
+            message = (
+                f"default duration scale {before:g} -> {self.script.default_scale:g};"
+                " existing wavs keep the old rate (f to redo a line)"
+            )
+            self.log_line(f"[yellow]{message}")
+            self.notify(message, severity="warning")
         self.update_status()
 
     def action_toggle_log(self) -> None:
@@ -643,10 +732,14 @@ def main() -> int:
     parser.add_argument(
         "--duration-scale",
         type=float,
-        default=DEFAULT_DURATION_SCALE,
-        help=f"speaking rate multiplier; lower is faster (default: {DEFAULT_DURATION_SCALE})",
+        help="speaking rate multiplier; lower is faster. Outranks a "
+        "#!duration-scale directive in the script "
+        f"(default: {DEFAULT_DURATION_SCALE})",
     )
     args = parser.parse_args()
+
+    if args.duration_scale is not None and not SCALE_MIN <= args.duration_scale <= SCALE_MAX:
+        parser.error(f"--duration-scale must be between {SCALE_MIN} and {SCALE_MAX}")
 
     if not Path(args.script).exists():
         parser.error(f"script not found: {args.script}")

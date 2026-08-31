@@ -2,9 +2,11 @@
 """Script parsing and speech synthesis core (Irodori-TTS v4.1, MLX 8bit).
 
 Output files follow the naming convention lineNN-HASH.wav. HASH is the first
-8 characters of a SHA-256 over "text + seed", so only lines whose text or seed
-changed need to be regenerated; when inserting or deleting lines merely shifts
-the numbering, a rename is enough.
+8 characters of a SHA-256 over "text + seed + the line's own duration scale, if
+it has one", so only lines whose text, seed or scale changed need to be
+regenerated; when inserting or deleting lines merely shifts the numbering, a
+rename is enough. The script-wide default scale is deliberately left out, so
+changing it does not invalidate every wav at once.
 """
 
 from __future__ import annotations
@@ -28,12 +30,36 @@ DEFAULT_MODEL = "mlx-community/Irodori-TTS-v4.1-Small-8bit"
 DEFAULT_SEED = 0
 # Slightly faster than the model's own pacing, which tends to drag.
 DEFAULT_DURATION_SCALE = 0.9
+# A scale of 0 collapses the predicted frame count, so stay well clear of it.
+SCALE_MIN, SCALE_MAX = 0.1, 3.0
 HASH_LENGTH = 8
 
 # Leading seed override, e.g. "12234, some text"
 SEED_PREFIX = re.compile(r"^(\d+)\s*,\s*(.+)$")
+# Leading duration scale override, e.g. "x0.85, some text"
+SCALE_PREFIX = re.compile(r"^[x\u00d7]\s*([0-9]*\.?[0-9]+)\s*,\s*(.+)$")
+# Script-wide default, e.g. "#!duration-scale 0.85". Written as a comment so
+# older readers and the utterance numbering ignore it.
+SCALE_DIRECTIVE = re.compile(r"^#!\s*duration-scale\s+(\S+)\s*$")
 # Only files we wrote ourselves are eligible for cleanup.
 OUTPUT_NAME = re.compile(r"^line(\d+)-([0-9a-f]{%d})\.wav$" % HASH_LENGTH)
+
+
+def _strip_prefixes(body: str) -> tuple[int | None, float | None, str]:
+    """Peel the seed and scale prefixes off a line, in either order.
+
+    Each is taken at most once, so a "0.85," that is part of the text survives.
+    Accepting both orders keeps "x0.85,123,text" from swallowing the seed into
+    the spoken text, which is an easy mistake to make by hand.
+    """
+    seed = scale = None
+    while True:
+        if seed is None and (match := SEED_PREFIX.match(body)):
+            seed, body = int(match.group(1)), match.group(2).strip()
+        elif scale is None and (match := SCALE_PREFIX.match(body)):
+            scale, body = float(match.group(1)), match.group(2).strip()
+        else:
+            return seed, scale, body
 
 
 @dataclass
@@ -41,12 +67,20 @@ class Line:
     index: int  # Utterance number (blank and comment lines are not counted)
     text: str
     seed: int
+    scale: float | None = None  # Duration scale; None inherits the script default
 
     @property
     def digest(self) -> str:
-        """Hash over text and seed. The HASH part of the file name."""
-        payload = f"{self.seed}\n{self.text}".encode("utf-8")
-        return hashlib.sha256(payload).hexdigest()[:HASH_LENGTH]
+        """Hash over text, seed and the scale override. The HASH of the file name.
+
+        A line without an override hashes exactly as it did before overrides
+        existed, so adopting this feature does not invalidate what is on disk.
+        """
+        if self.scale is None:
+            payload = f"{self.seed}\n{self.text}"
+        else:
+            payload = f"{self.seed}\n{self.scale:g}\n{self.text}"
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:HASH_LENGTH]
 
     @property
     def filename(self) -> str:
@@ -70,9 +104,18 @@ class Script:
     edit back from the TUI does not disturb the layout.
     """
 
-    def __init__(self, path: str | Path, default_seed: int = DEFAULT_SEED):
+    def __init__(
+        self,
+        path: str | Path,
+        default_seed: int = DEFAULT_SEED,
+        scale_override: float | None = None,
+    ):
         self.path = Path(path)
         self.default_seed = default_seed
+        # An explicit --duration-scale outranks the directive. It has to live
+        # here rather than be applied afterwards, or every reload would drop it.
+        self.scale_override = scale_override
+        self.warnings: list[str] = []  # Drained by the caller after each reload
         self.reload()
 
     def reload(self) -> list[Line]:
@@ -81,17 +124,68 @@ class Script:
         self.raw = text.splitlines()
         self.lines = []
         self._row_of: list[int] = []  # utterance number - 1 -> row in `raw`
+        self.default_scale = self._read_default_scale()
         for row, raw in enumerate(self.raw):
             body = raw.strip()
             if not body or body.startswith("#"):
                 continue
-            seed = self.default_seed
-            if match := SEED_PREFIX.match(body):
-                seed, body = int(match.group(1)), match.group(2).strip()
-            self.lines.append(Line(index=len(self.lines) + 1, text=body, seed=seed))
+            seed, scale, body = _strip_prefixes(body)
+            index = len(self.lines) + 1
+            if scale is not None:
+                scale = self._checked_scale(scale, f"line {index}")
+            self.lines.append(
+                Line(
+                    index=index,
+                    text=body,
+                    seed=self.default_seed if seed is None else seed,
+                    scale=scale,
+                )
+            )
             self._row_of.append(row)
         self._mtime = self._disk_mtime()
         return self.lines
+
+    def _checked_scale(self, value: float, where: str) -> float | None:
+        """Validate and normalize a scale, warning instead of raising.
+
+        reload() runs before the TUI is on screen, so an exception here would
+        kill the app with a bare traceback.
+        """
+        if not SCALE_MIN <= value <= SCALE_MAX:
+            self.warnings.append(
+                f"{where}: duration scale {value:g} is outside "
+                f"{SCALE_MIN}-{SCALE_MAX}, ignored"
+            )
+            return None
+        # Round-trip through the same format _format writes, so the value we
+        # generate with is always the value the file will hold.
+        return float(f"{value:g}")
+
+    def _read_default_scale(self) -> float:
+        """Resolve the script-wide default: CLI override, then directive, then built-in."""
+        found = None
+        for raw in self.raw:
+            match = SCALE_DIRECTIVE.match(raw.strip())
+            if not match:
+                continue
+            try:
+                value = float(match.group(1))
+            except ValueError:
+                self.warnings.append(f"ignored malformed directive: {raw.strip()}")
+                continue
+            if (checked := self._checked_scale(value, "#!duration-scale")) is None:
+                continue
+            if found is None:
+                found = checked
+            else:
+                self.warnings.append(f"ignored duplicate directive: {raw.strip()}")
+        if self.scale_override is not None:
+            return self.scale_override
+        return DEFAULT_DURATION_SCALE if found is None else found
+
+    def effective_scale(self, line: Line) -> float:
+        """The scale a line is actually generated at. Never None."""
+        return self.default_scale if line.scale is None else line.scale
 
     def _disk_mtime(self) -> int:
         try:
@@ -104,10 +198,15 @@ class Script:
         return self._disk_mtime() != self._mtime
 
     def _format(self, line: Line) -> str:
-        # Omit the prefix for the default seed, matching how scripts are written.
-        if line.seed == self.default_seed:
-            return line.text
-        return f"{line.seed},{line.text}"
+        parts = []
+        # Omit the prefix for the default seed, matching how scripts are written
+        # -- unless the text itself would then be read back as a prefix.
+        ambiguous = SEED_PREFIX.match(line.text) or SCALE_PREFIX.match(line.text)
+        if line.seed != self.default_seed or ambiguous:
+            parts.append(str(line.seed))
+        if line.scale is not None:
+            parts.append(f"x{line.scale:g}")
+        return ",".join(parts + [line.text])
 
     def _write_row(self, index: int) -> None:
         line = self.lines[index - 1]
@@ -117,8 +216,19 @@ class Script:
         self.lines[index - 1].seed = seed
         self._write_row(index)
 
+    def set_scale(self, index: int, scale: float | None) -> None:
+        """Set or, with None, clear the line's duration scale override."""
+        self.lines[index - 1].scale = scale
+        self._write_row(index)
+
     def set_text(self, index: int, text: str) -> None:
-        self.lines[index - 1].text = text.strip()
+        line = self.lines[index - 1]
+        line.text = text.strip()
+        # Text that itself starts like a scale prefix would be read back as one.
+        # Pinning the effective scale fills that slot, so the text survives; the
+        # value matches the default, so the audio does not change.
+        if line.scale is None and SCALE_PREFIX.match(line.text):
+            line.scale = self.default_scale
         self._write_row(index)
 
     def save(self) -> None:

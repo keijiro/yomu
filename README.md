@@ -48,6 +48,7 @@ to hear alternative takes, and `Enter` to adopt the one you want.
 | `g` `f` | Generate / regenerate even if up to date |
 | `a` | Generate every line that has no wav yet |
 | `e` `i` | Edit the line text / edit the instruct prompt |
+| `s` | Set the line's duration scale (empty to clear it) |
 | `x` `c` | Discard takes / cancel queued jobs |
 | `u` `l` `q` | Reload the script / toggle the log / quit |
 
@@ -62,8 +63,12 @@ clobber an edit made inside the TUI.
 ## Script format
 
 ```
+#!duration-scale 0.85
+
 Unity CLI is a program that drives Unity from the command line.
 12234, So really, there is nothing it cannot do.
+12234, x0.7, And this one is read faster than the rest.
+x1.1, Slower, on the default seed.
 ```
 
 An integer followed by a comma at the start of a line is used as that line's
@@ -71,18 +76,35 @@ seed. Lines without one use `--seed` (default 0), so results never change
 between runs. Blank lines and lines starting with `#` are ignored. The utterance
 number (`lineNN` in the file name) counts only the lines that are not ignored.
 
+`x0.7,` (or `×0.7,`) sets that line's duration scale, overriding the default for
+that line alone. It may come before or after the seed, and the value has to be
+between 0.1 and 3.0 — anything else is ignored with a warning.
+
+`#!duration-scale 0.85` sets the default for the whole script. It is a comment,
+so it does not shift the utterance numbering, and it survives edits made in the
+TUI. The first one in the file wins. An explicit `--duration-scale` on the
+command line outranks it.
+
 ## Output files
 
 `output/lineNN-HASH.wav`, where `HASH` is the first 8 characters of a SHA-256
-over **the line text and its seed**. Because of that:
+over **the line text, its seed, and its own duration scale if it has one**.
+Because of that:
 
-- only lines whose text or seed changed get regenerated
+- only lines whose text, seed or own duration scale changed get regenerated
 - wavs carrying a stale hash are deleted automatically
 - when inserting or deleting a line shifts the numbering, the affected files are
   renamed rather than regenerated
 
-`--instruct`, `--ref` and `--duration-scale` are *not* part of the hash. After
-changing one of those, use `f` to force a line to be redone.
+Giving a line a duration scale, changing it, or clearing it therefore marks that
+line — and only that line — for regeneration. A line with no scale of its own
+hashes exactly as it did before the feature existed, so existing wavs are not
+invalidated by upgrading. Writing `x0.9,` on a line while the default is already
+0.9 still costs one regeneration, since the hash cannot depend on the default.
+
+`--instruct`, `--ref` and the *default* duration scale are *not* part of the
+hash. After changing one of those, use `f` to force a line to be redone —
+including after editing `#!duration-scale`, which `u` will warn you about.
 
 ## Options
 
@@ -96,8 +118,10 @@ changing one of those, use `f` to force a line to be redone.
 Passing a whole directory as `--ref` enables v4 multi-clip cloning (each clip is
 encoded separately, then concatenated). The default is every wav under `refs/`.
 
-`--duration-scale` defaults to **0.9**, since the model's own pacing tends to
-drag. It applies to every line; pass 1.0 for the model's natural rate.
+The default duration scale is **0.9**, since the model's own pacing tends to
+drag. It applies to every line that does not set its own with `x0.7,`. Set it
+per script with `#!duration-scale`, or per run with `--duration-scale`, which
+wins when both are present. Valid values run from 0.1 to 3.0.
 
 Also available: `--model --seed --seq-len --cfg-mode --num-steps`.
 
