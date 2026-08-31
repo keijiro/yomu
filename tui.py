@@ -12,6 +12,7 @@ output/lineNN-HASH.wav, so the state on disk always matches the script.
 from __future__ import annotations
 
 import argparse
+import math
 import queue
 import random
 import shutil
@@ -27,6 +28,7 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Header, Input, Label, RichLog, Static
+from textual.widgets._footer import FooterKey  # Private, but the only handle on the keys
 
 from tts_core import (
     DEFAULT_DURATION_SCALE,
@@ -44,6 +46,7 @@ from tts_core import (
 )
 
 TAKES_DIR = "takes"
+FOOTER_MAX_ROWS = 4  # Past this the key hints crowd out the script
 SEED_MAX = 10000  # Written back to the script, so keep it to four digits
 
 
@@ -124,15 +127,75 @@ class PromptScreen(ModalScreen[str | None]):
 class LineTable(DataTable):
     """The script table.
 
-    Enter arrives as RowSelected and is wired to adopt. Left and right override
+    Enter arrives as RowSelected and is wired to adopt. It is re-declared here
+    only so the footer shows it: the table has focus, so its own hidden `enter`
+    binding would otherwise shadow the app-level one. Left and right override
     the DataTable default of moving the column cursor and cycle takes instead
     (the cursor is row-based, so column movement is useless here).
     """
 
     BINDINGS = [
+        Binding("enter", "select_cursor", "Adopt"),
         Binding("left", "app.cycle(-1)", "◀ take"),
         Binding("right", "app.cycle(1)", "take ▶"),
     ]
+
+
+class WrappedFooter(Footer):
+    """The key hints, wrapped over as many rows as the terminal needs.
+
+    The stock footer is a single horizontal strip, so once there are this many
+    bindings it simply runs off the side. Grid layout wraps instead: pick the
+    widest column count that still fits and let the row count follow, which
+    gives one row on a wide terminal and two or three as it narrows.
+    """
+
+    DEFAULT_CSS = """
+    WrappedFooter {
+        layout: grid;
+        grid-rows: 1;
+        grid-columns: auto;
+        grid-gutter: 0 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield from super().compose()
+        # Footer.compose() puts one column per binding, which is the one layout
+        # that cannot wrap. Re-fit once the keys have been through a layout pass.
+        self.call_after_refresh(self._fit)
+
+    def on_resize(self) -> None:
+        self._fit()
+
+    def _fit(self) -> None:
+        # The command palette hint is docked right, so it sits outside the grid
+        # but still eats width on the first row.
+        keys, docked = [], 0
+        for key in self.query(FooterKey):
+            if key.has_class("-command-palette"):
+                docked = key.outer_size.width
+            else:
+                keys.append(key.render().cell_len)
+        if not keys:
+            return
+        available = self.size.width - docked
+        for columns in range(len(keys), 1, -1):
+            # Grid fills row-major, so column c holds every columns-th key, and
+            # the columns are separated by a one cell gutter.
+            width = columns - 1 + sum(
+                max(keys[i] for i in range(c, len(keys), columns))
+                for c in range(columns)
+            )
+            if width <= available:
+                break
+        else:
+            columns = 1
+        # Below a certain width nothing fits, and stacking one key per row would
+        # swallow the table. Cap the rows and let the tail clip, as it did before.
+        columns = max(columns, math.ceil(len(keys) / FOOTER_MAX_ROWS))
+        self.styles.grid_size_columns = columns
+        self.styles.height = math.ceil(len(keys) / columns)
 
 
 class TtsApp(App):
@@ -162,7 +225,7 @@ class TtsApp(App):
         Binding("a", "generate_all", "Generate all"),
         Binding("e", "edit_text", "Edit text"),
         Binding("i", "edit_instruct", "Instruct", show=False),
-        Binding("s", "edit_scale", "Scale", show=False),
+        Binding("s", "edit_scale", "Scale"),
         Binding("x", "drop_takes", "Drop takes", show=False),
         Binding("c", "cancel_queue", "Cancel queue", show=False),
         Binding("u", "reload", "Reload", show=False),
@@ -213,7 +276,7 @@ class TtsApp(App):
         yield Static(id="status")
         yield LineTable(cursor_type="row", zebra_stripes=True)
         yield RichLog(id="log", markup=True, wrap=True)
-        yield Footer()
+        yield WrappedFooter()
 
     def on_mount(self) -> None:
         table = self.query_one(LineTable)
